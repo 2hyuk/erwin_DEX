@@ -34,10 +34,20 @@ contract Factory is IStateMachine {
         require(!emergencyStop, "EMERGENCY_STOP_ACTIVE");
         _;
     }
+
+    bool public initialized;
     
     constructor() {
         admin = msg.sender;
         currentState = State.Active; // 생성 시 활성화 상태로 시작
+        initialized = true;
+    }
+    // Factory뿐만 아니라 프록시 스토리지에도 Active 상태 초기화 되게끔 수정(추가)
+    function initialize() external {
+        require(!initialized, "AlREADY_INITIALIZED");
+        admin = msg.sender;
+        currentState = State.Active;
+        initialized = true;
     }
     
     function createExchange(address tokenAddress) public whenActive returns (address exchangeAddress) {
