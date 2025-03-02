@@ -16,14 +16,16 @@ contract Exchange is ERC20, IStateMachine {
     // Emergency Stop 구현
     bool public emergencyStop;
 
+    // 유동성 풀의 이더 잔액을 추적
+    uint public etherReserve;
+
     event TokenPurchase(address indexed buyer, uint256 indexed etherSold, uint256 indexed tokensBought);
     event EtherPurchase(address indexed buyer, uint256 indexed tokensSold, uint256 indexed etherBought);
     event AddLiquidity(address indexed provider, uint256 indexed etherAmount, uint256 indexed tokenAmount);
     event RemoveLiquidity(address indexed provider, uint256 indexed etherAmount, uint256 indexed tokenAmount);
     
-    constructor(
-        address _tokenAddress
-    ) ERC20("UPSIDE", "UP") {
+    constructor(address _tokenAddress) ERC20("UPSIDE", "UP") 
+    {
         tokenAddress = _tokenAddress;
         factory = msg.sender;
         currentState = State.Inactive;
@@ -58,7 +60,6 @@ contract Exchange is ERC20, IStateMachine {
         uint totalLiquidity = totalSupply();
 
         if (totalLiquidity == 0) {
-            
             require(maxTokenAmount > 0, "ZERO_TOKENS");
             
             uint etherAmount = msg.value;
@@ -70,15 +71,18 @@ contract Exchange is ERC20, IStateMachine {
 
             _mint(msg.sender, lpTokenAmount);
             
+            // 초기 유동성 풀 이더 잔액 저장
+            etherReserve = msg.value;
+            
             emit AddLiquidity(msg.sender, etherAmount, tokenAmount);
             return lpTokenAmount;
         } else {
-        
-            uint etherReserve = address(this).balance - msg.value;
+            // 기존 잔액은 별도의 상태 변수(etherReserve)로 관리
+            uint currentEtherReserve = etherReserve;
             uint tokenReserve = token.balanceOf(address(this));
             
-            lpTokenAmount = totalLiquidity * msg.value / etherReserve;
-            uint tokenAmount = tokenReserve * msg.value / etherReserve;
+            lpTokenAmount = totalLiquidity * msg.value / currentEtherReserve;
+            uint tokenAmount = tokenReserve * msg.value / currentEtherReserve;
             
             require(lpTokenAmount >= minLpTokenAmount, "INSUFFICIENT_LP_TOKENS");
             require(maxTokenAmount >= tokenAmount, "EXCESSIVE_TOKEN_AMOUNT");
@@ -87,6 +91,9 @@ contract Exchange is ERC20, IStateMachine {
             require(success, "TRANSFER_FAILED");
 
             _mint(msg.sender, lpTokenAmount);
+            
+            // 입금한 이더만큼 잔액 증가
+            etherReserve = currentEtherReserve + msg.value;
             
             emit AddLiquidity(msg.sender, msg.value, tokenAmount);
             return lpTokenAmount;
@@ -102,9 +109,12 @@ contract Exchange is ERC20, IStateMachine {
         uint totalLiquidity = totalSupply();
         ERC20 token = ERC20(tokenAddress);
         
-        etherAmount = address(this).balance * lpTokenAmount / totalLiquidity;
+        etherAmount = etherReserve * lpTokenAmount / totalLiquidity;
         tokenAmount = token.balanceOf(address(this)) * lpTokenAmount / totalLiquidity;
         _burn(msg.sender, lpTokenAmount);
+        
+        // 잔액 차감
+        etherReserve = etherReserve - etherAmount;
         
         // ETH 전송
         (bool success, ) = payable(msg.sender).call{value: etherAmount}("");
@@ -174,22 +184,22 @@ contract Exchange is ERC20, IStateMachine {
     /// @return inputAmount The amount of input token that needs to be provided
 
     function getOutputPrice(
-    uint outputAmount,  // B,  B값이 고정되어 있을 때 A의 값 찾는 것
-    uint inputReserve,  // X
-    uint outputReserve  // Y
-) public view returns (uint inputAmount) {
+        uint outputAmount,  // B,  B값이 고정되어 있을 때 A의 값 찾는 것
+        uint inputReserve,  // X
+        uint outputReserve  // Y
+    ) public view returns (uint inputAmount) {
     
-    require(outputAmount > 0, "ZERO_OUTPUT");
-    require(inputReserve > 0 && outputReserve > 0, "INSUFFICIENT_RESERVES");
-    require(outputAmount < outputReserve, "INSUFFICIENT_OUTPUT_RESERVE");
-    
-    // CPMM
-    uint numerator = inputReserve * outputAmount;
-    uint denominator = outputReserve - outputAmount;
-    uint inputAmountWithoutFee = numerator / denominator;
+        require(outputAmount > 0, "ZERO_OUTPUT");
+        require(inputReserve > 0 && outputReserve > 0, "INSUFFICIENT_RESERVES");
+        require(outputAmount < outputReserve, "INSUFFICIENT_OUTPUT_RESERVE");
+        
+        // CPMM
+        uint numerator = inputReserve * outputAmount;
+        uint denominator = outputReserve - outputAmount;
+        uint inputAmountWithoutFee = numerator / denominator;
 
-    uint randomFee = getRandomFee();
-    inputAmount = inputAmountWithoutFee * 1000 / (1000 - randomFee);
+        uint randomFee = getRandomFee();
+        inputAmount = inputAmountWithoutFee * 1000 / (1000 - randomFee);
     
     }
     event FeeApplied(uint fee);
@@ -202,9 +212,11 @@ contract Exchange is ERC20, IStateMachine {
         // Price Discovery
         uint etherSold = msg.value;
         ERC20 token = ERC20(tokenAddress);
+        // 잔액 관리하는 etherReserve 사용
+        uint currentEtherReserve = etherReserve;
         tokensBought = getInputPrice(
             etherSold, 
-            address(this).balance - msg.value, // 컨트랙트 호출하고 여기서 연산하는 시점에 이미 이더를 보냈기에, msg.value 빼줘야 풀 계수 유지됨
+            currentEtherReserve, // 기존 유동성 풀 잔액
             token.balanceOf(address(this))
         );
 
@@ -213,6 +225,9 @@ contract Exchange is ERC20, IStateMachine {
         bool success = token.transfer(msg.sender, tokensBought);
         require(success, "TRANSFER_FAILED");
 
+        // 이더 잔액 증가
+        etherReserve = currentEtherReserve + msg.value;
+        
         emit TokenPurchase(msg.sender, etherSold, tokensBought);
         return tokensBought;
     }
@@ -226,15 +241,19 @@ contract Exchange is ERC20, IStateMachine {
         
         // Price Discovery
         ERC20 token = ERC20(tokenAddress);
+        uint currentEtherReserve = etherReserve; // 기존 유동성 풀 잔액
         etherSold = getOutputPrice(
             tokensBought,
-            address(this).balance - msg.value,
+            currentEtherReserve,
             token.balanceOf(address(this))
         );
 
         // Effects
         require(msg.value >= etherSold, "INSUFFICIENT_ETH");
         require(maxEther >= etherSold, "EXCESSIVE_ETH_AMOUNT");
+
+        // 새로운 잔액 = 기존 잔액 + 입금액 - 사용된 이더
+        etherReserve = currentEtherReserve + msg.value - etherSold;
 
         // Refund (Pull )
         uint etherRefundAmount = msg.value - etherSold;
@@ -258,12 +277,13 @@ contract Exchange is ERC20, IStateMachine {
         
         require(tokensSold > 0, "ZERO_TOKENS");
         
-        // Price Discovery
+        
         ERC20 token = ERC20(tokenAddress);
+        uint currentEtherReserve = etherReserve;
         etherBought = getInputPrice(
             tokensSold,
             token.balanceOf(address(this)),
-            address(this).balance
+            currentEtherReserve
         );
 
         require(etherBought >= minEther, "INSUFFICIENT_OUTPUT");
@@ -271,6 +291,9 @@ contract Exchange is ERC20, IStateMachine {
         // 토큰 전송 (Pull)
         bool tokenSuccess = token.transferFrom(msg.sender, address(this), tokensSold);
         require(tokenSuccess, "TRANSFER_FAILED");
+        
+        // 업데이트: 이더 잔액 감소
+        etherReserve = currentEtherReserve - etherBought;
         
         // ETH 전송
         (bool success, ) = payable(msg.sender).call{value: etherBought}("");
@@ -286,14 +309,15 @@ contract Exchange is ERC20, IStateMachine {
     ) public whenActive returns (uint tokensSold) {
     
         require(etherBought > 0, "ZERO_ETH");
-        require(etherBought < address(this).balance, "INSUFFICIENT_ETH_RESERVES");
+        require(etherBought < etherReserve, "INSUFFICIENT_ETH_RESERVES"); // etherReserve 사용
         
         // Price Discovery
         ERC20 token = ERC20(tokenAddress);
+        uint currentEtherReserve = etherReserve;
         tokensSold = getOutputPrice(
             etherBought,
             token.balanceOf(address(this)),
-            address(this).balance
+            currentEtherReserve
         );
 
         require(maxTokens >= tokensSold, "EXCESSIVE_TOKEN_AMOUNT");
@@ -301,6 +325,9 @@ contract Exchange is ERC20, IStateMachine {
         // 토큰 전송 (Pull over Push pattern)
         bool tokenSuccess = token.transferFrom(msg.sender, address(this), tokensSold);
         require(tokenSuccess, "TRANSFER_FAILED");
+        
+        // 이더 잔액 감소
+        etherReserve = currentEtherReserve - etherBought;
         
         // ETH 전송
         (bool success, ) = payable(msg.sender).call{value: etherBought}("");
@@ -345,6 +372,5 @@ contract Exchange is ERC20, IStateMachine {
     
     // ETH 수신
     receive() external payable {
-        // ETH 입금 허용
     }
 }
